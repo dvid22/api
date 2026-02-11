@@ -44,10 +44,12 @@ function withTimeout(ms) {
   return { signal: controller.signal, cancel: () => clearTimeout(t) };
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /* =========================
    TILE HELPERS (Slippy map)
-   tileX = floor((lon+180)/360 * 2^z)
-   tileY = floor((1 - ln(tan(lat)+sec(lat))/pi)/2 * 2^z)
 ========================= */
 function lon2tileX(lon, z) {
   return Math.floor(((lon + 180) / 360) * Math.pow(2, z));
@@ -78,18 +80,15 @@ function tileBBox(x, y, z) {
 }
 
 function makeTilesForBBox({ south, west, north, east, z, maxTiles }) {
-  // Clamp lat/lon to valid ranges
   south = clamp(south, -85, 85);
   north = clamp(north, -85, 85);
   west = clamp(west, -180, 180);
   east = clamp(east, -180, 180);
 
-  // If bbox crosses antimeridian, split (simple safe approach)
   const bboxes = [];
   if (west <= east) {
     bboxes.push({ south, west, north, east });
   } else {
-    // e.g. west=170, east=-170 -> split
     bboxes.push({ south, west, north, east: 180 });
     bboxes.push({ south, west: -180, north, east });
   }
@@ -110,15 +109,70 @@ function makeTilesForBBox({ south, west, north, east, z, maxTiles }) {
     }
   }
 
-  // limit tiles to avoid abusing Overpass
   return Array.from(tiles.values()).slice(0, maxTiles);
+}
+
+/* =========================
+   OVERPASS (MIRRORS + RETRY)
+========================= */
+const OVERPASS_MIRRORS = [
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.openstreetmap.ru/api/interpreter",
+];
+
+async function fetchOverpassWithRetry({ query, timeoutMs, attempts }) {
+  let lastErr = null;
+
+  for (let a = 1; a <= attempts; a++) {
+    for (const url of OVERPASS_MIRRORS) {
+      const { signal, cancel } = withTimeout(timeoutMs);
+      try {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          },
+          body: `data=${encodeURIComponent(query)}`,
+          signal,
+        });
+
+        const txt = await r.text();
+
+        if (!r.ok) {
+          lastErr = new Error(`Overpass HTTP ${r.status} @ ${url}: ${txt.slice(0, 250)}`);
+          // errores transitorios típicos
+          if ([429, 502, 503, 504].includes(r.status)) continue;
+          throw lastErr;
+        }
+
+        let data;
+        try {
+          data = JSON.parse(txt);
+        } catch {
+          lastErr = new Error(`Overpass devolvió no-JSON @ ${url}: ${txt.slice(0, 200)}`);
+          continue;
+        }
+
+        return { url, data };
+      } catch (e) {
+        lastErr = e;
+        continue;
+      } finally {
+        cancel();
+      }
+    }
+
+    // backoff (suave)
+    await sleep(200 + a * a * 300);
+  }
+
+  throw lastErr || new Error("Overpass error desconocido");
 }
 
 /* =========================
    OSM / OVERPASS QUERY
 ========================= */
-// Categorías relevantes “seguras” para migrantes.
-// Nota: OSM depende de lo que esté mapeado. Esto da una base muy buena.
 const CATEGORY_QUERIES = {
   hospital: [
     'node["amenity"="hospital"]',
@@ -160,7 +214,6 @@ const CATEGORY_QUERIES = {
     'relation["amenity"="social_facility"]',
   ],
   help_center: [
-    // centros de ayuda / ONG cuando está mapeado
     'node["name"~"help center|assistance|resource center|aid",i]',
     'way["name"~"help center|assistance|resource center|aid",i]',
     'relation["name"~"help center|assistance|resource center|aid",i]',
@@ -186,12 +239,12 @@ function buildOverpassQueryForBBox({ south, west, north, east, categories, limit
   }
 
   return `
-    [out:json][timeout:25];
-    (
-      ${parts.join("\n")}
-    );
-    out tags center ${limit};
-  `;
+[out:json][timeout:25];
+(
+  ${parts.join("\n")}
+);
+out tags center ${limit};
+  `.trim();
 }
 
 function normalizeCategoryFromTags(tags, fallback) {
@@ -233,7 +286,6 @@ function normalizeOsmElement(el, tileKey) {
 
   const placeId = `${el.type}_${el.id}`;
   const docId = `osm_${placeId}`;
-
   const category = normalizeCategoryFromTags(tags, "general");
 
   return {
@@ -250,6 +302,7 @@ function normalizeOsmElement(el, tileKey) {
       tileKey,
       loc: new admin.firestore.GeoPoint(lat, lon),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      // createdAt se mantiene (merge true lo puede pisar, pero OK para tu caso)
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     },
   };
@@ -267,44 +320,17 @@ export default async function handler(req, res) {
     initFirebase();
     const db = admin.firestore();
 
-    // bbox can come as bbox=s,w,n,e OR south/west/north/east
-    const bboxRaw = clean(req.query.bbox);
-    let south, west, north, east;
-
-    if (bboxRaw) {
-      const parts = bboxRaw.split(",").map((x) => Number(x));
-      if (parts.length !== 4 || parts.some((x) => !Number.isFinite(x))) {
-        return res.status(400).json({ ok: false, error: "bbox inválido. Usa bbox=south,west,north,east" });
-      }
-      [south, west, north, east] = parts;
-    } else {
-      south = toNum(req.query.south);
-      west = toNum(req.query.west);
-      north = toNum(req.query.north);
-      east = toNum(req.query.east);
-      if ([south, west, north, east].some((v) => v === null)) {
-        return res.status(400).json({
-          ok: false,
-          error: "Falta bbox. Usa bbox=south,west,north,east (recomendado).",
-        });
-      }
-    }
-
-    // Zoom tile for grouping (12 funciona muy bien para mapas)
-    const z = clamp(toNum(req.query.z) ?? 12, 6, 16);
-
-    // Cuántos tiles máximo por llamada
-    const maxTiles = clamp(toNum(req.query.maxTiles) ?? 24, 1, 40);
-
-    // Overpass limit per tile response
-    const limit = clamp(toNum(req.query.limit) ?? 350, 80, 800);
-
-    // Lock por tile diario (default ON)
+    // Params comunes
     const DAILY_LOCK = (req.query.lock ?? "1").toString() !== "0";
     const FORCE = (req.query.force ?? "0").toString() === "1";
 
-    // Timeout configurable (default 25s)
-    const timeoutMs = clamp(toNum(req.query.timeoutMs) ?? 25000, 8000, 30000);
+    const zDefault = clamp(toNum(req.query.z) ?? 12, 6, 16);
+    const maxTiles = clamp(toNum(req.query.maxTiles) ?? 24, 1, 40);
+    const limit = clamp(toNum(req.query.limit) ?? 350, 80, 800);
+
+    // Timeout + retries (clave para 504)
+    const timeoutMs = clamp(toNum(req.query.timeoutMs) ?? 30000, 8000, 45000);
+    const attempts = clamp(toNum(req.query.attempts) ?? 4, 1, 6);
 
     const rawCats = clean(
       req.query.categories ||
@@ -318,17 +344,70 @@ export default async function handler(req, res) {
       .filter((c, i, arr) => arr.indexOf(c) === i)
       .slice(0, 10);
 
-    // Build visible tiles from bbox
-    const tiles = makeTilesForBBox({ south, west, north, east, z, maxTiles });
-
     const col = db.collection("safe_places_us");
     const metaCol = db.collection("safe_places_meta");
-
     const today = new Date().toISOString().slice(0, 10);
 
-    const overpassUrl = "https://overpass-api.de/api/interpreter";
+    // =========================
+    // MODE 1: tile=z_x_y  ✅ (para seed masivo)
+    // =========================
+    const tileParam = clean(req.query.tile);
+    let tiles = [];
+    let mode = "bbox_tiles";
 
-    let tilesTotal = tiles.length;
+    let bboxForResponse = null;
+    let z = zDefault;
+
+    if (tileParam) {
+      const parts = tileParam.split("_");
+      if (parts.length !== 3) {
+        return res.status(400).json({ ok: false, error: "tile inválido. Usa tile=z_x_y" });
+      }
+      const tz = toNum(parts[0]);
+      const tx = toNum(parts[1]);
+      const ty = toNum(parts[2]);
+      if ([tz, tx, ty].some((v) => v === null)) {
+        return res.status(400).json({ ok: false, error: "tile inválido. Usa tile=z_x_y" });
+      }
+      z = clamp(tz, 6, 16);
+      tiles = [{ z, x: tx, y: ty }];
+      mode = "tile";
+    } else {
+      // =========================
+      // MODE 2: bbox (normal)
+      // =========================
+      const bboxRaw = clean(req.query.bbox);
+      let south, west, north, east;
+
+      if (bboxRaw) {
+        const parts = bboxRaw.split(",").map((x) => Number(x));
+        if (parts.length !== 4 || parts.some((x) => !Number.isFinite(x))) {
+          return res.status(400).json({
+            ok: false,
+            error: "bbox inválido. Usa bbox=south,west,north,east",
+          });
+        }
+        [south, west, north, east] = parts;
+      } else {
+        south = toNum(req.query.south);
+        west = toNum(req.query.west);
+        north = toNum(req.query.north);
+        east = toNum(req.query.east);
+        if ([south, west, north, east].some((v) => v === null)) {
+          return res.status(400).json({
+            ok: false,
+            error: "Falta bbox. Usa bbox=south,west,north,east (recomendado).",
+          });
+        }
+      }
+
+      bboxForResponse = { south, west, north, east };
+
+      tiles = makeTilesForBBox({ south, west, north, east, z, maxTiles });
+    }
+
+    // Stats globales
+    const tilesTotal = tiles.length;
     let tilesSkippedByLock = 0;
     let tilesFetched = 0;
 
@@ -365,45 +444,34 @@ export default async function handler(req, res) {
         limit,
       });
 
-      const { signal, cancel } = withTimeout(timeoutMs);
-      let data;
-
-      try {
-        const r = await fetch(overpassUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-          body: `data=${encodeURIComponent(query)}`,
-          signal,
-        });
-
-        const txt = await r.text();
-        if (!r.ok) {
-          throw new Error(`Overpass HTTP ${r.status}: ${txt.slice(0, 250)}`);
-        }
-
-        try {
-          data = JSON.parse(txt);
-        } catch {
-          throw new Error(`Overpass devolvió no-JSON: ${txt.slice(0, 200)}`);
-        }
-      } finally {
-        cancel();
-      }
+      // ✅ Overpass robusto
+      const { data, url: mirrorUsed } = await fetchOverpassWithRetry({
+        query,
+        timeoutMs,
+        attempts,
+      });
 
       const elements = Array.isArray(data?.elements) ? data.elements : [];
-      fetchedElements += elements.length;
+
       tilesFetched++;
+      fetchedElements += elements.length;
+
+      // stats por tile (correctos)
+      let savedTile = 0;
+      let skippedNoCoordsTile = 0;
 
       for (const el of elements) {
         const norm = normalizeOsmElement(el, tileKey);
         if (!norm) {
           skippedNoCoords++;
+          skippedNoCoordsTile++;
           continue;
         }
 
         const ref = col.doc(norm.docId);
         batch.set(ref, norm.payload, { merge: true });
         saved++;
+        savedTile++;
         ops++;
 
         if (ops >= 450) {
@@ -413,7 +481,7 @@ export default async function handler(req, res) {
         }
       }
 
-      // Update meta tile
+      // Update meta tile (stats POR TILE)
       batch.set(
         metaRef,
         {
@@ -425,13 +493,15 @@ export default async function handler(req, res) {
           y: t.y,
           lastStats: {
             fetched: elements.length,
-            saved,
-            skippedNoCoords,
+            saved: savedTile,
+            skippedNoCoords: skippedNoCoordsTile,
+            mirrorUsed,
           },
         },
         { merge: true }
       );
       ops++;
+
       if (ops >= 450) {
         await batch.commit();
         batch = db.batch();
@@ -445,8 +515,9 @@ export default async function handler(req, res) {
 
     return res.json({
       ok: true,
-      mode: "bbox_tiles",
-      bbox: { south, west, north, east },
+      mode,
+      bbox: bboxForResponse,
+      tile: tileParam || null,
       z,
       categories,
       tilesTotal,

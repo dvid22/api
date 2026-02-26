@@ -140,8 +140,9 @@ async function fetchOverpassWithRetry({ query, timeoutMs, attempts }) {
         const txt = await r.text();
 
         if (!r.ok) {
-          lastErr = new Error(`Overpass HTTP ${r.status} @ ${url}: ${txt.slice(0, 250)}`);
-          // errores transitorios típicos
+          lastErr = new Error(
+            `Overpass HTTP ${r.status} @ ${url}: ${txt.slice(0, 250)}`
+          );
           if ([429, 502, 503, 504].includes(r.status)) continue;
           throw lastErr;
         }
@@ -150,7 +151,9 @@ async function fetchOverpassWithRetry({ query, timeoutMs, attempts }) {
         try {
           data = JSON.parse(txt);
         } catch {
-          lastErr = new Error(`Overpass devolvió no-JSON @ ${url}: ${txt.slice(0, 200)}`);
+          lastErr = new Error(
+            `Overpass devolvió no-JSON @ ${url}: ${txt.slice(0, 200)}`
+          );
           continue;
         }
 
@@ -163,7 +166,6 @@ async function fetchOverpassWithRetry({ query, timeoutMs, attempts }) {
       }
     }
 
-    // backoff (suave)
     await sleep(200 + a * a * 300);
   }
 
@@ -209,9 +211,6 @@ const CATEGORY_QUERIES = {
     'node["amenity"="community_centre"]',
     'way["amenity"="community_centre"]',
     'relation["amenity"="community_centre"]',
-    'node["amenity"="social_facility"]',
-    'way["amenity"="social_facility"]',
-    'relation["amenity"="social_facility"]',
   ],
   help_center: [
     'node["name"~"help center|assistance|resource center|aid",i]',
@@ -226,6 +225,42 @@ const CATEGORY_QUERIES = {
     'way["name"~"legal aid|immigration",i]',
     'relation["name"~"legal aid|immigration",i]',
   ],
+
+  // =========================
+  // 🔥 NUEVAS CATEGORÍAS
+  // =========================
+  fedex: [
+    'node["brand"~"FedEx",i]',
+    'way["brand"~"FedEx",i]',
+    'relation["brand"~"FedEx",i]',
+    'node["operator"~"FedEx",i]',
+    'way["operator"~"FedEx",i]',
+    'relation["operator"~"FedEx",i]',
+    'node["name"~"FedEx",i]',
+    'way["name"~"FedEx",i]',
+    'relation["name"~"FedEx",i]',
+  ],
+  usps: [
+    'node["amenity"="post_office"]',
+    'way["amenity"="post_office"]',
+    'relation["amenity"="post_office"]',
+    'node["operator"~"USPS|United States Postal Service",i]',
+    'way["operator"~"USPS|United States Postal Service",i]',
+    'relation["operator"~"USPS|United States Postal Service",i]',
+  ],
+  printing: [
+    'node["shop"="copyshop"]',
+    'way["shop"="copyshop"]',
+    'relation["shop"="copyshop"]',
+    'node["name"~"print|printing|copy|copies|fax",i]',
+    'way["name"~"print|printing|copy|copies|fax",i]',
+    'relation["name"~"print|printing|copy|copies|fax",i]',
+  ],
+  shipping: [
+    'node["amenity"="parcel_locker"]',
+    'way["amenity"="parcel_locker"]',
+    'relation["amenity"="parcel_locker"]',
+  ],
 };
 
 function buildOverpassQueryForBBox({ south, west, north, east, categories, limit }) {
@@ -237,6 +272,9 @@ function buildOverpassQueryForBBox({ south, west, north, east, categories, limit
       parts.push(`${s}(${south},${west},${north},${east});`);
     }
   }
+
+  // ✅ Protección: si no hay nada que consultar, devolvemos vacío
+  if (parts.length === 0) return "";
 
   return `
 [out:json][timeout:25];
@@ -251,13 +289,34 @@ function normalizeCategoryFromTags(tags, fallback) {
   const amenity = clean(tags?.amenity).toLowerCase();
   const healthcare = clean(tags?.healthcare).toLowerCase();
   const social = clean(tags?.social_facility).toLowerCase();
+  const shop = clean(tags?.shop).toLowerCase();
 
+  const name = clean(tags?.name).toLowerCase();
+  const brand = clean(tags?.brand).toLowerCase();
+  const operator = clean(tags?.operator).toLowerCase();
+
+  // 🔥 NUEVAS
+  if (brand.includes("fedex") || operator.includes("fedex") || name.includes("fedex")) {
+    return "fedex";
+  }
+  if (amenity === "post_office" || operator.includes("usps") || name.includes("usps")) {
+    return "usps";
+  }
+  if (shop === "copyshop" || name.includes("print") || name.includes("printing") || name.includes("copy")) {
+    return "printing";
+  }
+  if (amenity === "parcel_locker") {
+    return "shipping";
+  }
+
+  // EXISTENTES
   if (amenity === "hospital") return "hospital";
   if (amenity === "clinic" || healthcare === "clinic") return "clinic";
   if (amenity === "pharmacy") return "pharmacy";
   if (amenity === "shelter" || social === "shelter") return "shelter";
   if (social === "food_bank") return "food_bank";
   if (amenity === "community_centre") return "community";
+
   return fallback || "general";
 }
 
@@ -302,7 +361,6 @@ function normalizeOsmElement(el, tileKey) {
       tileKey,
       loc: new admin.firestore.GeoPoint(lat, lon),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      // createdAt se mantiene (merge true lo puede pisar, pero OK para tu caso)
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     },
   };
@@ -334,7 +392,7 @@ export default async function handler(req, res) {
 
     const rawCats = clean(
       req.query.categories ||
-        "hospital,clinic,pharmacy,shelter,food_bank,community,legal_aid,help_center"
+        "hospital,clinic,pharmacy,shelter,food_bank,community,legal_aid,help_center,fedex,usps,printing,shipping"
     );
 
     const categories = rawCats
@@ -343,6 +401,18 @@ export default async function handler(req, res) {
       .filter(Boolean)
       .filter((c, i, arr) => arr.indexOf(c) === i)
       .slice(0, 10);
+
+    // ✅ Protección: solo usamos categorías que existen en CATEGORY_QUERIES
+    const validCategories = categories.filter((c) => CATEGORY_QUERIES[c]);
+
+    if (validCategories.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          `No hay categorías válidas. Recibidas: ${categories.join(", ") || "(vacías)"}. ` +
+          `Válidas: ${Object.keys(CATEGORY_QUERIES).join(", ")}`,
+      });
+    }
 
     const col = db.collection("safe_places_us");
     const metaCol = db.collection("safe_places_meta");
@@ -432,7 +502,6 @@ export default async function handler(req, res) {
         }
       }
 
-      // bbox for this tile
       const [ts, tw, tn, te] = tileBBox(t.x, t.y, t.z);
 
       const query = buildOverpassQueryForBBox({
@@ -440,11 +509,21 @@ export default async function handler(req, res) {
         west: tw,
         north: tn,
         east: te,
-        categories,
+        categories: validCategories, // ✅ usamos solo las válidas
         limit,
       });
 
-      // ✅ Overpass robusto
+      // ✅ Protección: no mandamos query vacía a Overpass
+      if (!query || !query.trim()) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Query Overpass vacía. Revisa categories enviadas y CATEGORY_QUERIES.",
+          receivedCategories: categories,
+          validCategories,
+        });
+      }
+
       const { data, url: mirrorUsed } = await fetchOverpassWithRetry({
         query,
         timeoutMs,
@@ -456,7 +535,6 @@ export default async function handler(req, res) {
       tilesFetched++;
       fetchedElements += elements.length;
 
-      // stats por tile (correctos)
       let savedTile = 0;
       let skippedNoCoordsTile = 0;
 
@@ -481,7 +559,6 @@ export default async function handler(req, res) {
         }
       }
 
-      // Update meta tile (stats POR TILE)
       batch.set(
         metaRef,
         {
@@ -519,7 +596,7 @@ export default async function handler(req, res) {
       bbox: bboxForResponse,
       tile: tileParam || null,
       z,
-      categories,
+      categories: validCategories, // ✅ reportamos las válidas
       tilesTotal,
       tilesFetched,
       tilesSkippedByLock,

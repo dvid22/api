@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 // 👇 Handlers Vercel
 import newsHandler from "./api/news-us-immigration.js";
 import safeZonesHandler from "./api/safe-zones-us.js";
+import jobsHandler from "./api/jobs-us-theirstack.js"; // ✅ NUEVO
 
 dotenv.config();
 
@@ -26,11 +27,9 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (req, res) => {
-  res
-    .status(200)
-    .send(
-      "OK - Local server running. Try /api/news-us-immigration or /api/safe-zones-us"
-    );
+  res.status(200).send(
+    "OK - Local server running. Try /api/news-us-immigration or /api/safe-zones-us or /api/jobs-us-theirstack"
+  );
 });
 
 /* =========================
@@ -59,12 +58,26 @@ app.get("/api/safe-zones-us", async (req, res) => {
   }
 });
 
+/* =========================
+   JOBS ENDPOINT (THEIRSTACK)
+========================= */
+app.get("/api/jobs-us-theirstack", async (req, res) => {
+  try {
+    console.log("➡️  Hit /api/jobs-us-theirstack", req.query);
+    await jobsHandler(req, res);
+  } catch (e) {
+    console.error("❌ jobs handler crashed:", e);
+    res.status(500).json({ ok: false, error: e?.message || "handler crashed" });
+  }
+});
+
 const PORT = Number(process.env.PORT || 3000);
 
 app.listen(PORT, () => {
   console.log(`✅ Local running on http://localhost:${PORT}`);
   console.log(`➡️  http://localhost:${PORT}/api/news-us-immigration`);
   console.log(`➡️  http://localhost:${PORT}/api/safe-zones-us`);
+  console.log(`➡️  http://localhost:${PORT}/api/jobs-us-theirstack`);
 });
 
 // 🔍 Errores globales visibles

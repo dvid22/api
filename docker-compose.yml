@@ -1,0 +1,9 @@
+version: "3.9"
+
+services:
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    container_name: libretranslate
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
